@@ -7,6 +7,7 @@ from tqdm import tqdm
 import random
 import logging
 import pickle
+import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
@@ -113,3 +114,60 @@ def objective_function(model, p, q, r, kappa=10.0):
     total_loss = loss_a + loss_b + loss_c 
 
     return total_loss
+    
+class EvalDataset(torch.utils.data.IterableDataset):
+    def __init__(self, csv_file, device='cpu', chunksize=1000):
+        self.device = device
+        self.csv_file = csv_file
+        self.chunksize = chunksize
+
+    def __iter__(self):
+        """逐块加载 CSV 文件，并逐行返回样本。"""
+        with pd.read_csv(self.csv_file, chunksize=self.chunksize) as reader:
+            for chunk in reader:
+                for _, row in chunk.iterrows():
+                    fen = row['FEN']
+                    eval_value = str(row['Evaluation'])
+                    board = chess.Board(fen)
+                    flip = board.turn
+                    p = self.board2vec(board, flip=(not flip))
+                    if '#' in eval_value:
+                        eval_value = (1 if (int(eval_value[1:]) > 0) else -1) * 1e8
+                    else:
+                        eval_value = float(eval_value) / 100
+                    if not flip:
+                        eval_value = -eval_value
+                    yield p, torch.tensor([eval_value], dtype=torch.float32).to(self.device)
+
+    def board2vec(self, board, flip=False):
+        """将棋盘状态转换为张量表示。"""
+        vec = np.zeros((12, 8, 8), dtype=np.float32)
+        for square in chess.SQUARES:
+            piece = board.piece_at(square)
+            if piece is not None:
+                piece_index = piece_to_index[piece.symbol()]
+                row, col = divmod(square, 8)
+                if flip:
+                    # 翻转行
+                    row = 7 - row
+                    # 翻转棋子颜色
+                    if piece_index < 6:
+                        piece_index += 6
+                    else:
+                        piece_index -= 6
+                vec[piece_index, row, col] = 1
+        return torch.tensor(vec, dtype=torch.float32).to(self.device)
+
+
+def reinforcement_learning_loss(model, p1, eval1, p2, eval2, margin=0.1):
+    pred1 = model(p1).squeeze() 
+    pred2 = model(p2).squeeze() 
+    stockfish_relation = torch.sigmoid(eval1 - eval2).squeeze()
+    model_relation = torch.sigmoid(pred1 - pred2).squeeze()
+    try:
+        # 奖励或惩罚（使用二分类交叉熵损失）
+        loss = F.binary_cross_entropy(model_relation, stockfish_relation)
+    except RuntimeError:
+        print(model_relation, stockfish_relation)
+        raise
+    return loss

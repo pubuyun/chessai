@@ -2,7 +2,19 @@ import chess
 import chess.engine
 import torch
 import numpy as np
+from functools import lru_cache
 from chessModel import piece_to_index, ChessValueNetwork
+
+class HashableBoard(chess.Board):
+    def __hash__(self):
+        return hash(self.fen())
+
+    def __eq__(self, other):
+        if isinstance(other, HashableBoard):
+            return self.fen() == other.fen()
+        return False
+    
+chess.Board = HashableBoard
 
 def timeit(func):
     def wrapper(*args, **kwargs):
@@ -12,6 +24,18 @@ def timeit(func):
         print(f"Time elapsed: {end_time - start_time:.4f}s")
         return result
     return wrapper
+def count_calls(func):
+    """
+    装饰器：统计函数被调用的次数
+    """
+    def wrapper(*args, **kwargs):
+        wrapper.call_count += 1  # 增加计数器
+        return func(*args, **kwargs)
+
+    wrapper.call_count = 0  # 初始化计数器
+    return wrapper
+
+chess.Board
 
 class NeuralNetPlayer:
     def __init__(self, model, max_depth=3, device="cpu"):
@@ -54,6 +78,8 @@ class NeuralNetPlayer:
                         piece_index -= 6  
                 vec[piece_index, row, col] = 1
         return torch.tensor(vec, dtype=torch.float32).to(self.device)
+    
+    @lru_cache
     def evaluate_position(self, board, flip):
         """
         评估当前棋盘状态的分数。
@@ -147,17 +173,9 @@ class NeuralNetPlayer:
                     break  # 剪枝
 
         return best_value, best_move
-    def minimax_first_capturing(self, board, depth, alpha, beta, maximizing_player):
+    
+    def minimax_first_max(self, board, depth, alpha, beta, maximizing_player):
         CHECKMATE_SCORE = 1e10
-        """
-        Minimax 实现，用于评估并搜索最佳走法。
-        :param board: 当前棋盘状态
-        :param depth: 剩余搜索深度
-        :param alpha: Alpha 值
-        :param beta: Beta 值
-        :param maximizing_player: 是否为最大化玩家 (True 表示白方, False 表示黑方)
-        :return: (最佳分数, 最佳走法)
-        """
         if board.is_game_over():
             if board.is_checkmate():
                 return (-CHECKMATE_SCORE + depth if maximizing_player else CHECKMATE_SCORE - depth), None
@@ -167,13 +185,12 @@ class NeuralNetPlayer:
             flip = not maximizing_player
             return (1 if maximizing_player else -1) * self.evaluate_position(board, flip=flip), None
         best_move = None
-        capturing_moves = [move for move in board.legal_moves if board.is_capture(move)]
-        not_capturing_moves = [move for move in board.legal_moves if move not in capturing_moves]
+        moves = sorted(board.legal_moves, key=lambda x: self.evaluate_move(board, x, maximizing_player), reverse=True)
         if maximizing_player:
             best_value = float('-inf')
-            for move in capturing_moves+not_capturing_moves:
+            for move in moves:
                 board.push(move)
-                value, _ = self.minimax(board, depth - 1, alpha, beta, False)
+                value, _ = self.minimax_first_max(board, depth - 1, alpha, beta, False)
                 board.pop()
 
                 if value > best_value:
@@ -185,9 +202,9 @@ class NeuralNetPlayer:
                     break  # 剪枝
         else:
             best_value = float('inf')
-            for move in capturing_moves+not_capturing_moves:
+            for move in moves:
                 board.push(move)
-                value, _ = self.minimax(board, depth - 1, alpha, beta, True)
+                value, _ = self.minimax_first_max(board, depth - 1, alpha, beta, True)
                 board.pop()
 
                 if value < best_value:
@@ -199,7 +216,49 @@ class NeuralNetPlayer:
                     break  # 剪枝
 
         return best_value, best_move
+    def evaluate_move(self, board, move, turn):
+        board.push(move)
+        if board.is_checkmate():
+            board.pop()
+            return 1e10
+        value = self.evaluate_position(board, not turn)
+        board.pop()
+        return value
+    def negascout(self, board, depth, alpha, beta, maximizing_player):
+        CHECKMATE_SCORE = 1e10
+        if board.is_game_over():
+            if board.is_checkmate():
+                return (-CHECKMATE_SCORE + depth if maximizing_player else CHECKMATE_SCORE - depth), None
+            return 0, None
+        if depth == 0:
+            # 当前行动方为 maximizing_player，如果是黑方，则 flip = True
+            flip = not maximizing_player
+            return (1 if maximizing_player else -1) * self.evaluate_position(board, flip=flip), None
+        
+        best_move = None
+        a = alpha
+        b = beta
+        first_child = True
+        # 对合法走法排序以优化搜索效率
+        moves = sorted(board.legal_moves, key=lambda x: self.evaluate_move(board, x, maximizing_player), reverse=True)
 
+        for move in moves:
+            board.push(move)
+            t = -self.negascout(board, depth - 1, -b, -a, not maximizing_player)[0]
+            board.pop()
+            if t > a and t < beta and not first_child and depth > 1:
+                # Re-search
+                board.push(move)
+                t = -self.negascout(board, depth - 1, -beta, -t, not maximizing_player)[0]
+                board.pop()
+            if t > a:
+                a = t   
+                best_move = move
+            if a >= beta:
+                return a, best_move  # Cut-off
+            b = a + 1  # Null window
+            first_child = False
+        return a, best_move
 
     def get_best_move(self, board):
         """
@@ -207,7 +266,7 @@ class NeuralNetPlayer:
         :param board: 当前棋盘状态
         :return: 最佳走法 (chess.Move)
         """
-        best_value, best_move = self.minimax(board, depth=self.max_depth, alpha=float('-inf'), beta=float('inf'), maximizing_player=board.turn)
+        best_value, best_move = self.negascout(board, depth=self.max_depth, alpha=float('-inf'), beta=float('inf'), maximizing_player=board.turn)
         print("eval:", best_value)
 
         return best_move
@@ -496,12 +555,14 @@ class UCIPlayer:
             print("bestmove 0000")
 
 model = ChessValueNetwork()
-model.load_state_dict(torch.load("1.8.pth"))
+model.load_state_dict(torch.load("1.79.pth"))
 model.eval()
 
 if __name__ == "__main__":
-    uci_player = UCIPlayer(model, max_depth=4, device="cuda")
-    uci_player.start()
+    with torch.no_grad():
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        uci_player = UCIPlayer(model, max_depth=3, device=device)
+        uci_player.start()
 
 
 
